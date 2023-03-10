@@ -1,39 +1,52 @@
-//! Blinks the LED on a Pico board
+//! # Pico W Blinky Example
 //!
-//! This will blink an LED attached to GP25, which is the pin the Pico uses for the on-board LED.
+//! Blinks the LED on a Pico W board.
+//!
+//! This will blink an LED attached to WL_GPIO0, which is the pin the Pico W uses for
+//! the on-board LED. It is connected to the the Wifi chip so it cannot be set using RP2040 pins
+//!
+//! See the `Cargo.toml` file for Copyright and license details.
+
 #![no_std]
 #![no_main]
 
-use bsp::entry;
+use rp_pico_w::entry;
+
 use defmt::*;
 use defmt_rtt as _;
-use embedded_hal::digital::v2::OutputPin;
 use panic_probe as _;
 
-// Provide an alias for our BSP so we can switch targets quickly.
-// Uncomment the BSP you included in Cargo.toml, the rest of the code does not need to change.
-use rp_pico as bsp;
-// use sparkfun_pro_micro_rp2040 as bsp;
+use rp_pico_w::hal::pac;
 
-use bsp::hal::{
-    clocks::{init_clocks_and_plls, Clock},
-    pac,
-    sio::Sio,
-    watchdog::Watchdog,
-};
+use rp_pico_w::gspi::GSpi;
+use rp_pico_w::hal;
 
+use embedded_hal::digital::v2::OutputPin;
+
+use embassy_executor::raw::TaskPool;
+use embassy_executor::Executor;
+use embassy_executor::Spawner;
+use embassy_net::Stack;
+use embassy_time::{Duration, Timer};
+
+/// The function configures the RP2040 peripherals, initializes
+/// networking, then blinks the LED in an infinite loop.
+/// TODO: add some simple network service
 #[entry]
 fn main() -> ! {
-    info!("Program start");
-    let mut pac = pac::Peripherals::take().unwrap();
-    let core = pac::CorePeripherals::take().unwrap();
-    let mut watchdog = Watchdog::new(pac.WATCHDOG);
-    let sio = Sio::new(pac.SIO);
+    info!("start");
 
-    // External high-speed crystal on the pico board is 12Mhz
-    let external_xtal_freq_hz = 12_000_000u32;
-    let clocks = init_clocks_and_plls(
-        external_xtal_freq_hz,
+    // Grab our singleton objects
+    let mut pac = pac::Peripherals::take().unwrap();
+
+    // Set up the watchdog driver - needed by the clock setup code
+    let mut watchdog = hal::Watchdog::new(pac.WATCHDOG);
+
+    // Configure the clocks
+    //
+    // The default is to generate a 125 MHz system clock
+    let _clocks = hal::clocks::init_clocks_and_plls(
+        rp_pico_w::XOSC_CRYSTAL_FREQ,
         pac.XOSC,
         pac.CLOCKS,
         pac.PLL_SYS,
@@ -41,33 +54,137 @@ fn main() -> ! {
         &mut pac.RESETS,
         &mut watchdog,
     )
-    .ok()
-    .unwrap();
+        .ok()
+        .unwrap();
 
-    let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
+    let sio = hal::Sio::new(pac.SIO);
 
-    let pins = bsp::Pins::new(
+    let pins = rp_pico_w::Pins::new(
         pac.IO_BANK0,
         pac.PADS_BANK0,
         sio.gpio_bank0,
         &mut pac.RESETS,
     );
 
-    // This is the correct pin on the Raspberry Pico board. On other boards, even if they have an
-    // on-board LED, it might need to be changed.
-    // Notably, on the Pico W, the LED is not connected to any of the RP2040 GPIOs but to the cyw43 module instead. If you have
-    // a Pico W and want to toggle a LED with a simple GPIO output pin, you can connect an external
-    // LED to one of the GPIO pins, and reference that pin here.
-    let mut led_pin = pins.led.into_push_pull_output();
+    info!("init time driver");
+    let timer = hal::timer::Timer::new(pac.TIMER, &mut pac.RESETS);
+    unsafe { rp_pico_w::embassy_time_driver::init(timer) };
 
-    loop {
-        info!("on!");
-        led_pin.set_high().unwrap();
-        delay.delay_ms(500);
-        info!("off!");
-        led_pin.set_low().unwrap();
-        delay.delay_ms(500);
-    }
+    let mut executor = Executor::new();
+
+    // Safety: function never returns, executor is never dropped
+    let executor: &'static mut Executor = unsafe { forever_mut(&mut executor) };
+
+    let task_pool: TaskPool<_, 1> = TaskPool::new();
+    let task_pool = unsafe { forever(&task_pool) };
+
+    let state = cyw43::State::new();
+    let state = unsafe { forever(&state) };
+
+    info!("run spawner");
+    executor.run(|spawner| {
+        let spawn_token = task_pool.spawn(|| run(spawner, pins, state));
+        spawner.spawn(spawn_token).unwrap();
+    });
 }
 
-// End of file
+// TODO documentation
+unsafe fn forever_mut<T>(r: &'_ mut T) -> &'static mut T {
+    core::mem::transmute(r)
+}
+
+// TODO documentation
+unsafe fn forever<T>(r: &'_ T) -> &'static T {
+    core::mem::transmute(r)
+}
+
+async fn run(spawner: Spawner, pins: rp_pico_w::Pins, state: &'static cyw43::State) -> ! {
+    // These are implicitly used by the spi driver if they are in the correct mode
+    let mut spi_cs: hal::gpio::dynpin::DynPin = pins.wl_cs.into();
+    // TODO should be high from the beginning :-(
+    spi_cs.into_readable_output();
+    spi_cs.set_high().unwrap();
+    spi_cs.into_push_pull_output();
+    spi_cs.set_high().unwrap();
+
+    let mut spi_clk = pins.voltage_monitor_wl_clk.into_push_pull_output();
+    spi_clk.set_low().unwrap();
+
+    let mut spi_mosi_miso: hal::gpio::dynpin::DynPin = pins.wl_d.into();
+    spi_mosi_miso.into_readable_output();
+    spi_mosi_miso.set_low().unwrap();
+    spi_mosi_miso.into_push_pull_output();
+    spi_mosi_miso.set_low().unwrap();
+
+    let bus = GSpi::new(spi_clk, spi_mosi_miso);
+    let spi = embedded_hal_bus::spi::ExclusiveDevice::new(bus, spi_cs);
+
+    let pwr = pins.wl_on.into_push_pull_output();
+
+    let fw = cyw43::firmware::firmware();
+    let clm = cyw43::firmware::clm();
+
+    use embassy_futures::yield_now;
+    yield_now().await;
+
+    info!("create cyw43 driver");
+    let (mut control, runner) = cyw43::new(state, pwr, spi, fw).await;
+
+    let task_pool: TaskPool<_, 1> = TaskPool::new();
+    let task_pool = unsafe { forever(&task_pool) };
+    let spawn_token = task_pool.spawn(|| runner.run());
+    spawner.spawn(spawn_token).unwrap();
+
+    info!("init net net device");
+    let net_device = control.init(clm).await;
+    info!("init net net device done");
+
+    if option_env!("WIFI_NETWORK").is_some() {
+        if option_env!("WIFI_PASSWORD").is_some() {
+            control
+                .join_wpa2(
+                    option_env!("WIFI_NETWORK").unwrap(),
+                    option_env!("WIFI_PASSWORD").unwrap(),
+                )
+                .await;
+        } else {
+            control
+                .join_open(option_env!("WIFI_NETWORK").unwrap())
+                .await;
+        }
+    } else {
+        warn!("Environment variable WIFI_NETWORK not set during compilation - not joining wireless network");
+    }
+    let config = embassy_net::ConfigStrategy::Dhcp;
+    //let config = embassy_net::ConfigStrategy::Static(embassy_net::Config {
+    //    address: Ipv4Cidr::new(Ipv4Address::new(192, 168, 69, 2), 24),
+    //    dns_servers: Vec::new(),
+    //    gateway: Some(Ipv4Address::new(192, 168, 69, 1)),
+    //});
+
+    // Generate random seed
+    let seed = 0x0123_4567_89ab_cdef; // chosen by fair dice roll. guarenteed to be random.
+
+    let mut stack_resources = embassy_net::StackResources::<1, 2, 8>::new();
+    let stack_resources = unsafe { forever_mut(&mut stack_resources) };
+
+    // Init network stack
+    let stack = Stack::new(net_device, config, stack_resources, seed);
+    let stack = unsafe { forever(&stack) };
+
+    let task_pool: TaskPool<_, 1> = TaskPool::new();
+    let task_pool = unsafe { forever(&task_pool) };
+    let spawn_token = task_pool.spawn(|| stack.run());
+    spawner.spawn(spawn_token).unwrap();
+
+    // Blink the LED at 1 Hz
+    loop {
+        info!("on");
+        control.gpio_set(0, true).await;
+        Timer::after(Duration::from_millis(500)).await;
+
+        info!("off");
+        control.gpio_set(0, false).await;
+        Timer::after(Duration::from_millis(500)).await;
+    }
+}
